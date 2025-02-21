@@ -1,0 +1,282 @@
+## Simulate synthetic data with multiple time-varying confounders
+
+```{r}
+# Extract model matrix without intercept and remove duplicate columns
+X_match_left = as.data.frame(modelmatrix[,-1]) 
+X_match_left = X_match_left[,!duplicated(as.list(X_match_left))]
+X_match_left = as.matrix(X_match_left)
+
+# Combine extracted covariates with outcome variable
+d = data.frame(X_match_left, mt30stat = dat$mt30stat)
+
+# Estimate the log-odds of death using logistic regression
+m = glm(mt30stat ~., family = binomial(link = "logit"), data = d)
+fitted_log_odds <- predict(m, type = "link") - 0.4*d$Z 
+
+set.seed(10)
+
+# Generate synthetic data
+sync_dat = d %>% 
+  # Simulate multiple time-varying covariates at the initial present time
+  mutate(tv1_origin = rnorm(nrow(d), mean = 3, sd = 1), 
+         tv2_origin = runif(nrow(d), min = 0, max = 3),
+         tv3_origin = rpois(nrow(d), lambda = 5)) %>% 
+  # Adjust time-varying covariates after transfer for transferred patients
+  mutate(tv1 = ifelse(Z == 1, tv1_origin + rlnorm(nrow(d), meanlog = log(0.3), sdlog = 0.1), tv1_origin),
+         tv2 = ifelse(Z == 1, tv2_origin + runif(nrow(d), min = -0.5, max = 0), tv2_origin),
+         tv3 = ifelse(Z == 1, tv3_origin + rpois(nrow(d), lambda = 0.5) , tv3_origin)) %>% 
+  # Define log-odds for the outcome incorporating time-varying covariates
+  mutate(log_odds = 0.1*tv1 - 0.1*tv2 + 0.1*tv3 + fitted_log_odds) %>% # Log odds of death
+  mutate(prob = exp(log_odds) / (1 + exp(log_odds))) %>% # Convert log odds to probabilities
+  mutate(Y = rbinom(nrow(d), 1, prob)) # Generate binary outcome 
+ 
+# Add fine balance covariate
+X_fb = as.matrix(dat[, c('distearloc', 'disretloc', 'distalextloc')])
+sync_dat = cbind(sync_dat, X_fb)
+
+# Plot the distribution of time-varying covariates by treatment group
+sync_dat %>%
+  gather(key = "variable", value = "value", tv1,tv2,tv3) %>%  
+  ggplot(aes(x = value, fill = factor(Z))) + 
+  geom_density(alpha = 0.5) + 
+  facet_wrap(~ variable, scales = "free") +  
+  labs(x = "Value",
+       y = "Density",
+       fill = "Group (Z)") +  
+  theme_minimal()  
+```
+
+## Fit Prognostic Score Model Using Control Units
+```{r}
+# Subset data to include only control units
+dc = sync_dat %>% 
+  filter(Z==0) 
+
+# Fit a logistic regression model to estimate prognostic scores
+progs_model = glm(Y ~ age+bmi+hdef+hdef_missingYes+genderMale+hypertnYes+
+                    raceOther+raceWhite+cancerYes+statusEmergent+
+                    statusUrgent.Salvage+heartfailacuteYes+tv1+tv2+tv3, 
+                  family = binomial(link = "logit"), 
+                  data = dc)
+
+# Predict prognostic scores for all units
+progscores <- predict(progs_model, newdata = sync_dat, type = "response") 
+sync_dat$progscores <- progscores
+```
+
+## Primary Analysis
+```{r}
+# Define time-unvarying and time-varying covariates
+time_unvarying_covs = c("age","bmi","hdef","hdef_missingYes","genderMale",
+                        "hypertnYes","raceOther","raceWhite",
+                        "cancerYes","statusEmergent","statusUrgent.Salvage",
+                        "heartfailacuteYes")
+
+time_varying_covs = c("tv1","tv2","tv3")
+
+# Fit propensity score model using logistic regression
+sync_dat$pscore = glm(Z ~., family = binomial(link = "logit"),
+                      data = as.data.frame(cbind(sync_dat[,c("Z",
+                                                             time_unvarying_covs,
+                                                             time_varying_covs)])))$fitted.values
+
+# Distance list for closely matching using Mahalanobis distance
+dist_list_left <- create_list_from_scratch(sync_dat$Z, 
+                                           sync_dat[,c(time_unvarying_covs,time_varying_covs)], 
+                                           p = sync_dat$pscore,
+                                           caliper_low = 0.5,
+                                           k = 1000,
+                                           method = 'robust maha')
+
+dist_list_left$d <- 1e2 * dist_list_left$d # Scale distances
+
+# Distance list based on propensity scores using L1 distance
+dist_list_right = create_list_from_scratch(Z = sync_dat$Z, 
+                                           X = sync_dat$pscore,
+                                           p = sync_dat$pscore,
+                                           caliper_low = 1,
+                                           k = 1000,
+                                           method = 'L1') 
+
+# Distance list based on prognostic scores using L1 distance
+dist_list_right_prog = create_list_from_scratch(Z = sync_dat$Z, 
+                                           X = sync_dat$progscores,
+                                           p = sync_dat$pscore,
+                                           caliper_low = 1,
+                                           k = 1000,
+                                           method = 'L1') 
+
+# Distance list for fine balance on categorical variables
+dist_list_right_fb = create_list_from_scratch(Z = sync_dat$Z, 
+                                               X = sync_dat[,c("distearloc","disretloc","distalextloc")],
+                                               p = sync_dat$pscore,
+                                               caliper_low = 1,
+                                               k = 1000,
+                                               method = 'L1')
+
+# Combine distance metrics for the RHS
+dist_list_right$d = (1000*dist_list_right$d + 1000*dist_list_right_prog$d + 5e2*dist_list_right_fb$d)
+
+dat_full = dat %>% 
+    mutate(tv1 = sync_dat$tv1,
+         tv2 = sync_dat$tv2,
+         tv3 = sync_dat$tv3,
+         tv1_origin = sync_dat$tv1_origin,
+         tv2_origin = sync_dat$tv2_origin,
+         tv3_origin = sync_dat$tv3_origin,
+         Y = sync_dat$Y,
+         prognostic.score = sync_dat$progscores,
+         propensity.score = sync_dat$pscore)
+
+# Pair Matching
+matching_output = match_2C_list(Z = sync_dat$Z, 
+                                dataset = dat_full,
+                                dist_list_1 = dist_list_left, # close matching 
+                                dist_list_2 = dist_list_right, # fine balancing
+                                lambda = 10,
+                                controls = 1)
+
+# Extract matched units
+dt_matched = matching_output$data_with_matched_set_ind %>% filter(!is.na(matched_set))
+dt_treated = dt_matched %>% filter(Z == 1)
+dt_treated = dt_treated[order(dt_treated$matched_set),]
+dt_control = dt_matched %>% filter(Z == 0)
+dt_control = dt_control[order(dt_control$matched_set),]
+
+# Balance Table
+vars_fb = c("distearloc2", "disretloc2", "distalextloc2")
+table = print(tableone::CreateTableOne(vars = c("tv1", "tv2","tv3",
+                                                 vars_to_include, vars_fb,
+                                                "propensity.score",
+                                                "prognostic.score","Y"), 
+                                       factorVars = c(cat_vars_to_include, vars_fb, "Y"), 
+                                       data = rbind(dt_treated, dt_control), 
+                                       includeNA = T, strata = 'Z', test = T))
+
+# Perform McNemar’s test to compare outcomes between matched pairs
+resB = mcnemar_test(dt_treated, dt_control, str = 'Y')
+resB = as.data.frame(resB)
+rownames(resB) = c("100*mean(treated_outcome)","100*mean(control_outcome)",
+                   "estimate", "CI.lower", "CI.higher", "p.value")
+```
+
+## Sensitivity Analysis with Directional Penalty on Prognostic Scores
+```{r}
+# Compute propensity scores using time-unvarying covariates
+sync_dat$propensity = glm(Z ~., family = binomial(link = "logit"), 
+                          data = as.data.frame(cbind(sync_dat[,c("Z",time_unvarying_covs)])))$fitted.values
+
+# Closely matching on time-unvarying covariates 
+dist_list_left_dir <- create_list_from_scratch(sync_dat$Z, 
+                                           sync_dat[,time_unvarying_covs], 
+                                           p = sync_dat$propensity,
+                                           caliper_low = 0.5,
+                                           k = 1000,
+                                           method = 'robust maha')
+
+dist_list_left_dir$d <- 1e2 * dist_list_left_dir$d # Scale distances
+
+# L1 distance on propensity score
+dist_list_right_dir = create_list_from_scratch(Z = sync_dat$Z, 
+                                           X = sync_dat$propensity,
+                                           p = sync_dat$propensity,
+                                           caliper_low = 1,
+                                           k = 1000,
+                                           method = 'L1') #L1 distance RHS
+
+# Near fine balance of three categorical variables
+dist_list_right_fb_dir = create_list_from_scratch(Z = sync_dat$Z, 
+                                               X = sync_dat[,c("distearloc", "disretloc", "distalextloc")],
+                                               p = sync_dat$propensity,
+                                               caliper_low = 1,
+                                               k = 1000,
+                                               method = 'L1')
+
+# Define directional distance function
+directional_dist <- function(X_control, X_treated_i){
+  d_1 = sweep(X_control, 2, as.matrix(X_treated_i)) 
+  return(d_1)
+}
+
+# Distance between treated and control units based on prognostic scores
+dist_list_dir = create_list_from_scratch(Z = sync_dat$Z, 
+                                         X = as.matrix(sync_dat[, "progscores"]),
+                                         p = sync_dat$propensity,
+                                         caliper_low = 1,
+                                         k = 1000,
+                                         method = 'other',
+                                         dist_func = directional_dist)
+
+# Function for matching with directional penalty on prognostic scores
+transfer_match <- function(epsilon_LB = -0.03, epsilon_UB = -0.02,
+                           lambda_ps = 10000, a = 5e3, b = 5000, c = 5000){
+  
+  # Apply directional penalty
+  d_LB = epsilon_LB - dist_list_dir$d
+  d_UB = dist_list_dir$d - epsilon_UB
+  dist_list_right_dir$d = (lambda_ps*dist_list_right_dir$d + a*dist_list_right_fb_dir$d) + b*d_LB + c*d_UB
+  
+  # Ensure non-negative distances
+  if (any(dist_list_right_dir$d < 0)){
+    offset_d = -min(dist_list_right_dir$d)
+    dist_list_right_dir$d = dist_list_right_dir$d + offset_d
+  }
+  
+  # Prepare data for matching
+  dat_full = dat %>% 
+    mutate(tv1 = sync_dat$tv1,
+         tv2 = sync_dat$tv2,
+         tv3 = sync_dat$tv3,
+         tv1_origin = sync_dat$tv1_origin,
+         tv2_origin = sync_dat$tv2_origin,
+         tv3_origin = sync_dat$tv3_origin,
+         Y = sync_dat$Y,
+         prognostic.score = sync_dat$progscores,
+         propensity.score = sync_dat$propensity)
+  
+  start_time <- Sys.time()
+  
+  # Perform pair matching
+  matching_output_dir = match_2C_list(Z = sync_dat$Z, 
+                                  dataset = dat_full,
+                                  dist_list_1 = dist_list_left_dir, # close matching 
+                                  dist_list_2 = dist_list_right_dir, # fine balancing
+                                  lambda = 1,
+                                  controls = 1)
+  end_time <- Sys.time()
+  print(end_time - start_time)
+  
+  # Extract matched data
+  dt_matched_dir = matching_output_dir$data_with_matched_set_ind %>% filter(!is.na(matched_set))
+  dt_treated_dir = dt_matched_dir %>% filter(Z == 1)
+  dt_treated_dir = dt_treated_dir[order(dt_treated_dir$matched_set),]
+  dt_control_dir = dt_matched_dir %>% filter(Z == 0)
+  dt_control_dir = dt_control_dir[order(dt_control_dir$matched_set),]
+  
+  # Create balance table
+  vars_fb = c("distearloc2", "disretloc2", "distalextloc2") 
+  print(xtable(print(tableone::CreateTableOne(
+    vars = c("tv1", "tv2", "tv3", vars_to_include, vars_fb, "propensity.score","prognostic.score","Y"), 
+    factorVars = c(cat_vars_to_include, vars_fb, "Y"), 
+    data = rbind(dt_treated_dir, dt_control_dir), 
+    includeNA = T, strata = 'Z', test = T), smd = T)))
+  
+  # Print prognostic score difference
+  matched_dir = rbind(dt_treated_dir, dt_control_dir)
+  prog_summary = matched_dir %>%
+    group_by(Z) %>%
+    summarise(prognostic.score_mean = mean(prognostic.score)) 
+  print(prog_summary)
+ 
+  # Outcome analysis using McNemar's test
+  resB = mcnemar_test(dt_treated_dir, dt_control_dir, str = 'Y')
+  resB = as.data.frame(resB)
+  rownames(resB) = c("100*mean(treated_outcome)","100*mean(control_outcome)",
+                     "estimate", "CI.lower", "CI.higher", "p.value")
+  print(xtable::xtable(resB, digits = 5))
+}
+
+# Example Run
+transfer_match(epsilon_LB = -0.05, epsilon_UB = -0.03,
+                           lambda_ps = 100000, a = 5e2, b = 3000, c = 4000)
+```
